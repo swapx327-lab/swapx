@@ -1,0 +1,6 @@
+{
+  "name": "SwapX",
+  "description": "Campus paid tutoring marketplace with dual-role accounts, Razorpay Route escrow, and verified KYC protection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

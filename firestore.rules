@@ -1,0 +1,585 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================================================
+    // GLOBAL DEFAULT-DENY SAFETY NET
+    // ============================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ============================================================================
+    // REUSABLE HELPER FUNCTIONS
+    // ============================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin' ||
+        (request.auth.token.email == 'manralshubh24@gmail.com' && request.auth.token.email_verified == true)
+      );
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isBookingParticipant(data) {
+      return isSignedIn() && (request.auth.uid == data.studentId || request.auth.uid == data.teacherId);
+    }
+
+    // Resolves firstSessionDate whether stored as native Firestore timestamp, epoch millis, or YYYY-MM-DD string
+    function getFirstSessionTimestamp(data) {
+      return data.firstSessionDate is timestamp 
+        ? data.firstSessionDate 
+        : (data.keys().hasAny(['firstSessionDateMillis']) && data.firstSessionDateMillis is int 
+            ? timestamp.value(data.firstSessionDateMillis) 
+            : (data.firstSessionDate is string && data.firstSessionDate.size() >= 10
+                ? timestamp.date(
+                    int(data.firstSessionDate[0:4]),
+                    int(data.firstSessionDate[5:7]),
+                    int(data.firstSessionDate[8:10])
+                  )
+                : request.time));
+    }
+
+    function isMoreThan48hBefore(sessionTs) {
+      return request.time <= sessionTs - duration.value(48, 'h');
+    }
+
+    function isBetween24hAnd48hBefore(sessionTs) {
+      return request.time > sessionTs - duration.value(48, 'h')
+          && request.time <= sessionTs - duration.value(24, 'h');
+    }
+
+    function isUnder24hOrAfter(sessionTs) {
+      return request.time > sessionTs - duration.value(24, 'h');
+    }
+
+    function isTerminalStatus(status) {
+      return status in [
+        'funds_released',
+        'refunded',
+        'cancelled_student',
+        'cancelled_teacher',
+        'dispute_resolved_refund',
+        'dispute_resolved_release',
+        'dispute_resolved_split'
+      ];
+    }
+
+    function isValidCancellationWithTimestamp(existingData, incomingData) {
+      let sessionTs = getFirstSessionTimestamp(existingData);
+      return (
+        // Tier 1: > 48 hours before session -> ONLY 100% refund is valid
+        (
+          isMoreThan48hBefore(sessionTs)
+          && incomingData.cancellationRefundPercentage == 100
+          && incomingData.cancellationRefundAmountINR == existingData.totalAmountINR
+        )
+        ||
+        // Tier 2: 24h to 48h before session -> ONLY 50% refund is valid
+        (
+          isBetween24hAnd48hBefore(sessionTs)
+          && incomingData.cancellationRefundPercentage == 50
+          && incomingData.cancellationRefundAmountINR == (existingData.totalAmountINR * 50) / 100
+        )
+        ||
+        // Tier 3: < 24h before session or after session starts -> ONLY 0% refund is valid
+        (
+          isUnder24hOrAfter(sessionTs)
+          && incomingData.cancellationRefundPercentage == 0
+          && incomingData.cancellationRefundAmountINR == 0
+        )
+      );
+    }
+
+    function isValidTerminalReview(database, incomingData, reviewId) {
+      let booking = get(/databases/$(database)/documents/bookings/$(incomingData.bookingId)).data;
+      return isTerminalStatus(booking.status)
+        && incomingData.bookingOutcome == booking.status
+        && incomingData.rating is int
+        && incomingData.rating >= 1 && incomingData.rating <= 5
+        && reviewId == incomingData.bookingId + '_' + request.auth.uid
+        && (
+          (request.auth.uid == booking.studentId && incomingData.authorRole == 'student' && incomingData.targetUserId == booking.teacherId)
+          ||
+          (request.auth.uid == booking.teacherId && incomingData.authorRole == 'teacher' && incomingData.targetUserId == booking.studentId)
+        );
+    }
+
+    // ============================================================================
+    // 1. USERS & SENSITIVE FINANCIAL/KYC ISOLATION
+    // ============================================================================
+    // Public user profile: read-accessible to all signed-in campus members
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      
+      // Users can manage standard profile fields, but CANNOT self-verify KYC
+      allow create: if isOwner(userId)
+        && (!incoming().keys().hasAny(['isKycVerified']) || incoming().isKycVerified == false);
+        
+      allow update: if (isOwner(userId) && !incoming().diff(existing()).affectedKeys().hasAny(['isKycVerified']))
+        || isAdmin();
+        
+      allow delete: if false;
+
+      // Sensitive KYC & PII Vault: PAN number, bank account, IFSC, holder name
+      // STRICTLY ISOLATED: Accessible ONLY by the document owner or compliance admin
+      match /private/financial {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create, update: if isOwner(userId) || isAdmin();
+        allow delete: if false;
+      }
+    }
+
+    // ============================================================================
+    // 2. LISTINGS (Skill Marketplace)
+    // ============================================================================
+    match /listings/{listingId} {
+      // Anyone can browse listings
+      allow read: if true;
+
+      // Authenticated users can publish listings under their own ID
+      allow create: if isSignedIn() 
+        && incoming().creatorId == request.auth.uid
+        && incoming().priceINR > 0
+        && incoming().skillName is string && incoming().skillName.size() >= 2 && incoming().skillName.size() <= 100
+        && incoming().description is string && incoming().description.size() <= 2000;
+
+      // Only the creator can update or delete their listing
+      allow update: if isSignedIn() 
+        && existing().creatorId == request.auth.uid
+        && incoming().creatorId == existing().creatorId;
+
+      allow delete: if isSignedIn() && existing().creatorId == request.auth.uid;
+    }
+
+    // ============================================================================
+    // 3. BOOKINGS (Escrow Lifecycle, Cancellation, 7-Day Window, Dispute Resolution)
+    // ============================================================================
+    match /bookings/{bookingId} {
+      // Access limited strictly to participants or platform admin
+      allow read: if isSignedIn() && (isBookingParticipant(existing()) || isAdmin());
+
+      // Booking Creation:
+      // Direct client creation disabled. All bookings created by trusted server logic upon payment verification.
+      allow create: if false;
+
+      // Booking State Transitions & Actions
+      allow update: if isSignedIn() && (
+        // ------------------------------------------------------------------------
+        // TRANSITION A: Student Confirms Lesson (Instant Release to Teacher)
+        // ------------------------------------------------------------------------
+        (
+          (request.auth.uid == existing().studentId || isAdmin())
+          && existing().status in ['escrow_held', 'marked_complete']
+          && incoming().status == 'funds_released'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'releasedAt'])
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION B: Teacher Marks Lesson Complete (Starts 72h Dispute Countdown)
+        // ------------------------------------------------------------------------
+        (
+          (request.auth.uid == existing().teacherId || isAdmin())
+          && existing().status == 'escrow_held'
+          && incoming().status == 'marked_complete'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'markedCompleteAt', 'disputeDeadline'])
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION C: Student Disputes Lesson within 72h (Locks Escrow)
+        // ------------------------------------------------------------------------
+        (
+          (request.auth.uid == existing().studentId || isAdmin())
+          && existing().status == 'marked_complete'
+          && incoming().status == 'disputed_manual_review'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'disputeReason', 'disputedAt'])
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION D: Mutual Completion Extension (Strictly 1-7 days, Max 1 use)
+        // ------------------------------------------------------------------------
+        (
+          // D1: Participant requests extension (+1 to 7 days; booking cannot have used extension before)
+          (
+            existing().extensionUsed == false
+            && incoming().extensionUsed == true
+            && isBookingParticipant(existing())
+            && incoming().currentExtension.daysRequested >= 1
+            && incoming().currentExtension.daysRequested <= 7
+            && incoming().currentExtension.requestedByUserId == request.auth.uid
+            && incoming().currentExtension.status == 'pending'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['currentExtension', 'extensionUsed'])
+          )
+          ||
+          // D2: Counterparty responds (requester and responder must be different participants)
+          (
+            existing().currentExtension.status == 'pending'
+            && isBookingParticipant(existing())
+            && request.auth.uid != existing().currentExtension.requestedByUserId
+            && incoming().currentExtension.status in ['approved', 'rejected']
+            && incoming().currentExtension.requestedByUserId == existing().currentExtension.requestedByUserId
+            && incoming().currentExtension.daysRequested == existing().currentExtension.daysRequested
+            && incoming().extensionUsed == true
+            && incoming().diff(existing()).affectedKeys().hasOnly(['currentExtension', 'completionDeadline'])
+          )
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION E: Auto-Release or Fixed 7-Day Deadline Auto-Refund
+        // ------------------------------------------------------------------------
+        (
+          // E1: 72h dispute window elapsed without dispute -> auto-release
+          (
+            incoming().status == 'funds_released'
+            && existing().status == 'marked_complete'
+            && request.time >= existing().disputeDeadline
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'releasedAt'])
+          )
+          ||
+          // E2: Fixed 7-day completion window expired without completion -> 100% refund
+          (
+            incoming().status == 'refunded'
+            && existing().status in ['escrow_held', 'marked_complete']
+            && request.time >= existing().completionDeadline
+            && (!('currentExtension' in existing()) || existing().currentExtension.status != 'pending')
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'refundedAt'])
+          )
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION F: Cancellation Policy (Pre-completion cancellations)
+        // ------------------------------------------------------------------------
+        (
+          // F1: Teacher Cancels -> ALWAYS 100% full refund to student
+          (
+            request.auth.uid == existing().teacherId
+            && existing().status == 'escrow_held'
+            && incoming().status == 'cancelled_teacher'
+            && incoming().cancellationRefundPercentage == 100
+            && incoming().cancellationRefundAmountINR == existing().totalAmountINR
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'cancelledAt',
+              'cancelledBy',
+              'cancellationReason',
+              'cancellationRefundPercentage',
+              'cancellationRefundAmountINR'
+            ])
+          )
+          ||
+          // F2: Student Cancels -> Enforce real-time tiered refund math against firstSessionDate
+          (
+            request.auth.uid == existing().studentId
+            && existing().status == 'escrow_held'
+            && incoming().status == 'cancelled_student'
+            && isValidCancellationWithTimestamp(existing(), incoming())
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'cancelledAt',
+              'cancelledBy',
+              'cancellationReason',
+              'cancellationRefundPercentage',
+              'cancellationRefundAmountINR'
+            ])
+          )
+        )
+        ||
+        // ------------------------------------------------------------------------
+        // TRANSITION G: Three-Outcome Manual Dispute Resolution (Admin / Reviewer)
+        // ------------------------------------------------------------------------
+        (
+          isAdmin()
+          && existing().status == 'disputed_manual_review'
+          && (
+            // Outcome G1: 100% Refund to Student
+            (
+              incoming().status in ['dispute_resolved_refund', 'refunded']
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'status',
+                'resolvedAt',
+                'resolvedBy',
+                'disputeResolutionNotes'
+              ])
+            )
+            ||
+            // Outcome G2: 100% Release to Teacher
+            (
+              incoming().status in ['dispute_resolved_release', 'funds_released']
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'status',
+                'resolvedAt',
+                'resolvedBy',
+                'disputeResolutionNotes'
+              ])
+            )
+            ||
+            // Outcome G3: Split Resolution (custom split between student & teacher)
+            (
+              incoming().status == 'dispute_resolved_split'
+              && incoming().studentRefundINR > 0
+              && incoming().teacherPayoutINR > 0
+              && (incoming().studentRefundINR + incoming().teacherPayoutINR) <= existing().totalAmountINR
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'status',
+                'resolvedAt',
+                'resolvedBy',
+                'disputeResolutionNotes',
+                'studentRefundINR',
+                'teacherPayoutINR'
+              ])
+            )
+          )
+        )
+      );
+
+      // Bookings can never be deleted to preserve financial audit trails
+      allow delete: if false;
+    }
+
+    // ============================================================================
+    // 4. TRANSACTIONS (Financial Ledger)
+    // ============================================================================
+    match /transactions/{txnId} {
+      // Users can only read their own ledger transactions; admins can audit all
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      // Transactions are immutable audit entries linked to verified bookings
+      allow create: if isSignedIn()
+        && incoming().userId == request.auth.uid
+        && incoming().bookingId is string
+        && exists(/databases/$(database)/documents/bookings/$(incoming().bookingId))
+        && (
+          isBookingParticipant(get(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data)
+          || isAdmin()
+        )
+        && incoming().amountINR > 0
+        && incoming().type in [
+          'payment_escrow',
+          'escrow_payout',
+          'escrow_refund',
+          'platform_fee',
+          'cancellation_refund',
+          'dispute_split_payout',
+          'dispute_split_refund'
+        ];
+
+      // Financial ledger is append-only and strictly immutable
+      allow update, delete: if false;
+    }
+
+    // ============================================================================
+    // 5. REVIEWS (Two-Way, Terminal-State Only, Strictly Immutable)
+    // ============================================================================
+    match /reviews/{reviewId} {
+      // Reviews are public to logged-in campus members to build peer reputation
+      allow read: if isSignedIn();
+
+      // Review Creation Constraints:
+      // 1. Must reference an existing booking
+      // 2. Strict Terminal-State Gate: Booking status must be in a terminal state
+      // 3. Author must be an actual participant in the booking
+      // 4. Author can only review the counterparty (student -> teacher, teacher -> student)
+      // 5. Rating must be an integer between 1 and 5
+      // 6. Exactly 1 review per direction: enforced via document ID '$(bookingId)_$(auth.uid)'
+      // 7. Distinct bookingOutcome tagging matching the booking's terminal status
+      allow create: if isSignedIn()
+        && incoming().authorId == request.auth.uid
+        && incoming().bookingId is string
+        && exists(/databases/$(database)/documents/bookings/$(incoming().bookingId))
+        && isValidTerminalReview(database, incoming(), reviewId);
+
+      // Reviews are permanent and tamper-proof: edits and deletions are forbidden
+      allow update, delete: if false;
+    }
+
+    // ============================================================================
+    // 6. REQUEST LOCKS (Preventing Concurrent/Duplicate Active Requests)
+    // ============================================================================
+    match /requestLocks/{lockId} {
+      allow read: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.teacherId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Student creates only for themselves
+      // teacherId must match the referenced listing's creatorId
+      // Student and teacher must differ
+      // lockId == studentId + '_' + listingId
+      // Initial status must be pending_teacher_response
+      allow create: if isSignedIn()
+        && request.auth.uid == incoming().studentId
+        && lockId == incoming().studentId + '_' + incoming().listingId
+        && incoming().studentId != incoming().teacherId
+        && exists(/databases/$(database)/documents/listings/$(incoming().listingId))
+        && incoming().teacherId == get(/databases/$(database)/documents/listings/$(incoming().listingId)).data.creatorId
+        && incoming().status == 'pending_teacher_response'
+        && incoming().requestId is string;
+
+      // Reuse/Update:
+      // - Student can reuse lock ONLY if its current status is 'rejected'
+      // - Teacher can update status from 'pending_teacher_response' to 'accepted_pending_payment' or 'rejected'
+      allow update: if isSignedIn() && (
+        (
+          request.auth.uid == existing().studentId
+          && existing().status == 'rejected'
+          && incoming().status == 'pending_teacher_response'
+          && incoming().requestId is string
+          && incoming().diff(existing()).affectedKeys().hasOnly(['requestId', 'status'])
+        )
+        ||
+        (
+          request.auth.uid == existing().teacherId
+          && existing().status == 'pending_teacher_response'
+          && incoming().status in ['accepted_pending_payment', 'rejected']
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status'])
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    // ============================================================================
+    // 7. LEARNING REQUESTS
+    // ============================================================================
+    match /learningRequests/{requestId} {
+      allow read: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.teacherId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Student creates only for themselves
+      // teacherId must match the listing creator
+      // Student and teacher must differ
+      // priceINR must match the listing's current price at creation
+      // Initial status must be 'pending_teacher_response'
+      // activePaymentId must be null
+      allow create: if isSignedIn()
+        && request.auth.uid == incoming().studentId
+        && incoming().studentId != incoming().teacherId
+        && exists(/databases/$(database)/documents/listings/$(incoming().listingId))
+        && incoming().teacherId == get(/databases/$(database)/documents/listings/$(incoming().listingId)).data.creatorId
+        && incoming().priceINR == get(/databases/$(database)/documents/listings/$(incoming().listingId)).data.priceINR
+        && incoming().status == 'pending_teacher_response'
+        && incoming().activePaymentId == null;
+
+      // Updates:
+      // 1. Teacher can transition only from pending_teacher_response to accepted_pending_payment or rejected
+      // 2. Student can update activePaymentId only while status is accepted_pending_payment,
+      //    and only when existing activePaymentId is null or referenced previous payment has payment_failed.
+      // Client cannot set 'confirmed'.
+      allow update: if isSignedIn() && (
+        (
+          request.auth.uid == existing().teacherId
+          && existing().status == 'pending_teacher_response'
+          && incoming().status in ['accepted_pending_payment', 'rejected']
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'respondedAt'])
+        )
+        ||
+        (
+          request.auth.uid == existing().studentId
+          && existing().status == 'accepted_pending_payment'
+          && incoming().diff(existing()).affectedKeys().hasOnly(['activePaymentId'])
+          && incoming().activePaymentId is string
+          && (
+            existing().activePaymentId == null
+            || (
+              exists(/databases/$(database)/documents/payments/$(existing().activePaymentId))
+              && get(/databases/$(database)/documents/payments/$(existing().activePaymentId)).data.status == 'payment_failed'
+            )
+          )
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    // ============================================================================
+    // 8. PAYMENTS
+    // ============================================================================
+    match /payments/{paymentId} {
+      allow read: if isSignedIn() && (
+        resource.data.studentId == request.auth.uid ||
+        resource.data.teacherId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Student creates only their own payment
+      // Initial status must be 'payment_initiated'
+      // Request must currently be 'accepted_pending_payment'
+      // Amount must equal the learning request's priceINR
+      // Matching studentId and teacherId
+      allow create: if isSignedIn()
+        && request.auth.uid == incoming().studentId
+        && incoming().status == 'payment_initiated'
+        && exists(/databases/$(database)/documents/learningRequests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/learningRequests/$(incoming().requestId)).data.status == 'accepted_pending_payment'
+        && incoming().amountINR == get(/databases/$(database)/documents/learningRequests/$(incoming().requestId)).data.priceINR
+        && incoming().teacherId == get(/databases/$(database)/documents/learningRequests/$(incoming().requestId)).data.teacherId
+        && incoming().studentId == get(/databases/$(database)/documents/learningRequests/$(incoming().requestId)).data.studentId;
+
+      // Client cannot change payment status to payment_success or payment_failed.
+      // Updates are forbidden to clients; handled by trusted backend/admin.
+      allow update: if isAdmin();
+
+      allow delete: if false;
+    }
+
+    // ============================================================================
+    // 9. NOTIFICATIONS
+    // ============================================================================
+    match /notifications/{notifId} {
+      // Read only by the notification recipient
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+
+      // Notification Creation:
+      // 1. new_request: sender (fromUserId) must be authenticated student and recipient (userId) must be teacher of referenced request
+      // 2. request_accepted / request_rejected: sender (fromUserId) must be teacher of referenced request and recipient (userId) must be student
+      // 3. payment_confirmed: client creation forbidden
+      allow create: if isSignedIn() && (
+        (
+          incoming().type == 'new_request'
+          && request.auth.uid == incoming().fromUserId
+          && exists(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId))
+          && incoming().fromUserId == get(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId)).data.studentId
+          && incoming().userId == get(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId)).data.teacherId
+        )
+        ||
+        (
+          incoming().type in ['request_accepted', 'request_rejected']
+          && request.auth.uid == incoming().fromUserId
+          && exists(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId))
+          && incoming().fromUserId == get(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId)).data.teacherId
+          && incoming().userId == get(/databases/$(database)/documents/learningRequests/$(incoming().relatedRequestId)).data.studentId
+        )
+      );
+
+      // Recipient can mark notification as read
+      allow update: if isSignedIn()
+        && existing().userId == request.auth.uid
+        && incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+        && incoming().read is bool;
+
+      allow delete: if isSignedIn() && existing().userId == request.auth.uid;
+    }
+  }
+}

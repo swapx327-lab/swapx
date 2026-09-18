@@ -1,0 +1,129 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public student profile displaying basic campus info and KYC verification status.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 150 },
+        "college": { "type": "string", "maxLength": 120 },
+        "avatar": { "type": "string" },
+        "isKycVerified": { "type": "boolean", "description": "System verified status. Bookings are blocked if false." },
+        "hasSubmittedKyc": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "email", "isKycVerified"]
+    },
+    "SensitiveKYC": {
+      "title": "SensitiveKYC",
+      "description": "Private financial and KYC records. Isolated in /users/{userId}/private/financial, accessible ONLY by owner.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "panNumber": { "type": "string", "pattern": "^[A-Z]{5}[0-9]{4}[A-Z]{1}$", "maxLength": 10 },
+        "bankAccountNumber": { "type": "string", "minLength": 9, "maxLength": 18 },
+        "ifscCode": { "type": "string", "pattern": "^[A-Z]{4}0[A-Z0-9]{6}$", "maxLength": 11 },
+        "accountHolderName": { "type": "string", "maxLength": 100 },
+        "bankName": { "type": "string", "maxLength": 100 },
+        "status": { "type": "string", "enum": ["pending", "verified", "rejected"] },
+        "submittedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "panNumber", "bankAccountNumber", "ifscCode", "accountHolderName", "status"]
+    },
+    "Listing": {
+      "title": "Listing",
+      "description": "Tutoring skill listing published by a student. Goes live immediately upon creation.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "creatorId": { "type": "string" },
+        "creatorName": { "type": "string" },
+        "creatorCollege": { "type": "string" },
+        "skillName": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "priceINR": { "type": "number", "description": "Price in INR per session" },
+        "category": { "type": "string" },
+        "sessionDurationMins": { "type": "number" },
+        "isLive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "creatorId", "skillName", "priceINR", "isLive"]
+    },
+    "Booking": {
+      "title": "Booking",
+      "description": "Lesson booking backed by Razorpay Route escrow holding teacher funds.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "listingId": { "type": "string" },
+        "skillName": { "type": "string" },
+        "studentId": { "type": "string" },
+        "studentName": { "type": "string" },
+        "teacherId": { "type": "string" },
+        "teacherName": { "type": "string" },
+        "totalAmountINR": { "type": "number" },
+        "platformCommissionINR": { "type": "number" },
+        "teacherShareINR": { "type": "number" },
+        "razorpayPaymentId": { "type": "string" },
+        "razorpayTransferId": { "type": "string" },
+        "isMultiSession": { "type": "boolean" },
+        "firstSessionDate": { "type": "string" },
+        "lastSessionDate": { "type": "string" },
+        "completionDeadline": { "type": "string" },
+        "extensionUsed": { "type": "boolean", "description": "Strictly limited to exactly 1 extension per booking total" },
+        "status": {
+          "type": "string",
+          "enum": [
+            "escrow_held",
+            "marked_complete",
+            "funds_released",
+            "refunded",
+            "disputed_manual_review"
+          ]
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "listingId", "studentId", "teacherId", "totalAmountINR", "status", "completionDeadline"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Financial ledger entry for escrow payment, payout, fee or refund.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "bookingId": { "type": "string" },
+        "userId": { "type": "string" },
+        "type": { "type": "string", "enum": ["payment_escrow", "escrow_payout", "escrow_refund", "platform_fee"] },
+        "amountINR": { "type": "number" },
+        "status": { "type": "string", "enum": ["held", "released", "refunded"] },
+        "description": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "bookingId", "userId", "type", "amountINR", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Public student profile with KYC verification flag"
+    },
+    "/users/{userId}/private/financial": {
+      "schema": "SensitiveKYC",
+      "description": "Sensitive PAN & bank details, isolated to owner only"
+    },
+    "/listings/{listingId}": {
+      "schema": "Listing",
+      "description": "Publicly browsable and searchable tutoring listings"
+    },
+    "/bookings/{bookingId}": {
+      "schema": "Booking",
+      "description": "Escrow bookings, restricted to student and teacher participants"
+    },
+    "/transactions/{txnId}": {
+      "schema": "Transaction",
+      "description": "User specific ledger transactions"
+    }
+  }
+}
